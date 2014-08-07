@@ -16,28 +16,37 @@
 #define IEEE80211_FTYPE_CTL             0x0004
 #define IEEE80211_FTYPE_DATA            0x0008
 
-#define IEEE80211_STYPE_CTL_EXT         0x0060
-#define IEEE80211_STYPE_BACK_REQ        0x0080
-#define IEEE80211_STYPE_BACK            0x0090
-#define IEEE80211_STYPE_PSPOLL          0x00A0
-#define IEEE80211_STYPE_RTS             0x00B0
-#define IEEE80211_STYPE_CTS             0x00C0
-#define IEEE80211_STYPE_ACK             0x00D0
-#define IEEE80211_STYPE_CFEND           0x00E0
-#define IEEE80211_STYPE_CFENDACK        0x00F0
+#define IEEE80211_STYPE_CTL_EXT         0x006
+#define IEEE80211_STYPE_BACK_REQ        0x008
+#define IEEE80211_STYPE_BACK            0x009
+#define IEEE80211_STYPE_PSPOLL          0x00A
+#define IEEE80211_STYPE_RTS             0x00B
+#define IEEE80211_STYPE_CTS             0x00C
+#define IEEE80211_STYPE_ACK             0x00D
+#define IEEE80211_STYPE_CFEND           0x00E
+#define IEEE80211_STYPE_CFENDACK        0x00F
 
-#define IEEE80211_STYPE_ASSOC_REQ       0x0000
-#define IEEE80211_STYPE_ASSOC_RESP      0x0010
-#define IEEE80211_STYPE_REASSOC_REQ     0x0020
-#define IEEE80211_STYPE_REASSOC_RESP    0x0030
-#define IEEE80211_STYPE_PROBE_REQ       0x0040
-#define IEEE80211_STYPE_PROBE_RESP      0x0050
-#define IEEE80211_STYPE_BEACON          0x0080
-#define IEEE80211_STYPE_ATIM            0x0090
-#define IEEE80211_STYPE_DISASSOC        0x00A0
-#define IEEE80211_STYPE_AUTH            0x00B0
-#define IEEE80211_STYPE_DEAUTH          0x00C0
-#define IEEE80211_STYPE_ACTION          0x00D0
+#define IEEE80211_STYPE_ASSOC_REQ       0x000
+#define IEEE80211_STYPE_ASSOC_RESP      0x001
+#define IEEE80211_STYPE_REASSOC_REQ     0x002
+#define IEEE80211_STYPE_REASSOC_RESP    0x003
+#define IEEE80211_STYPE_PROBE_REQ       0x004
+#define IEEE80211_STYPE_PROBE_RESP      0x005
+#define IEEE80211_STYPE_BEACON          0x008
+#define IEEE80211_STYPE_ATIM            0x009
+#define IEEE80211_STYPE_DISASSOC        0x00A
+#define IEEE80211_STYPE_AUTH            0x00B
+#define IEEE80211_STYPE_DEAUTH          0x00C
+#define IEEE80211_STYPE_ACTION          0x00D
+
+#define CNORMAL  "\033[0m"
+#define CRED     "\033[31m"
+#define CGREEN   "\033[32m"
+#define CYELLOW  "\033[33m"
+#define CBLUE    "\033[34m"
+#define CMAGENTA "\033[35m"
+#define CCYAN    "\033[36m"
+#define CWHITE   "\033[37m"
 
 int sock;
 
@@ -76,7 +85,7 @@ const char * subtype_name(int type, int stype)
 		else
 			return "Unknown Control";
 	}
-	else if (type == IEEE80211_FTYPE_CTL) {
+	else if (type == IEEE80211_FTYPE_MGMT) {
 		if (stype == IEEE80211_STYPE_BEACON)
 			return "Beacon";
 		else
@@ -86,13 +95,13 @@ const char * subtype_name(int type, int stype)
 		return "Data";
 }
 
-int sock_bind() { 
+int sock_bind(const char * ifname) { 
     struct sockaddr_ll sll;
     struct ifreq ifr; bzero(&sll , sizeof(sll));
     bzero(&ifr , sizeof(ifr)); 
-    strncpy((char *)ifr.ifr_name ,"hwsim0" , IFNAMSIZ); 
+    strncpy((char *)ifr.ifr_name , ifname, IFNAMSIZ); 
     //copy device name to ifr 
-    if((ioctl(sock, SIOCGIFINDEX , &ifr)) == -1)
+    if((ioctl(sock, SIOCGIFINDEX, &ifr)) == -1)
     { 
         perror("Unable to find interface index");
         exit(-1); 
@@ -118,7 +127,6 @@ int sock_open()
 			printf("Socket creation failed: %d", errno);
 		return errno;
 	}
-	if (sock_bind()) return errno;
 	return 0;
 }
 
@@ -130,7 +138,7 @@ void sock_close()
 void print_addr(unsigned char* addr)
 {
 	for(int i = 0; i < 6; i++)
-		i == 5 ? printf("%x", addr[i]) : printf("%x:", addr[i]);
+		i == 5 ? printf("%02x", addr[i]) : printf("%02x:", addr[i]);
 }
 
 struct wframe buffertowframe(char * buffer, int size)
@@ -164,14 +172,21 @@ struct wframe buffertowframe(char * buffer, int size)
 	frame.powermgmt = (fc & 0x800);
 	frame.nav = buffer[pos];
 	pos += 2;
-	memcpy(&frame.addr1, buffer+pos, 6);
+	memcpy(&frame.addr1, buffer+pos, 6); //This address is always there
 	pos += 6;
+	if (frame.type == IEEE80211_FTYPE_CTL)
+		if (frame.type == IEEE80211_STYPE_CTS || 
+		    frame.type == IEEE80211_STYPE_ACK)
+			goto FCS;
 	memcpy(&frame.addr2, buffer+pos, 6);
 	pos += 6;
+	if (frame.type == IEEE80211_FTYPE_CTL)
+		goto FCS;
 	memcpy(&frame.addr3, buffer+pos, 6);
 	pos += 6;
 
-	pos += 2; //TODO: Parse sequence number
+FCS:
+	pos += 2; //TODO: Parse sequence number (fcs)
 
 	return frame;
 }
@@ -183,7 +198,45 @@ void print_nowifi()
 
 void print_wifi(struct wframe frame)
 {
+	if (frame.type == IEEE80211_FTYPE_MGMT)
+		printf(CYELLOW "M ");
+	else if (frame.type == IEEE80211_FTYPE_CTL)
+		printf(CCYAN "C ");
+	else if (frame.type == IEEE80211_FTYPE_DATA)
+		printf(CWHITE "D ");
 
+	printf("%s ", subtype_name(frame.type, frame.stype));
+
+	if (frame.type == IEEE80211_FTYPE_CTL)
+	{
+		switch (frame.stype)
+		{
+			case IEEE80211_STYPE_RTS:
+				printf("RX: ");
+				print_addr(frame.addr1);
+				printf(" TX: ");
+				print_addr(frame.addr2);
+				break;
+			case IEEE80211_STYPE_CTS:
+				printf("RX: ");
+				print_addr(frame.addr1);
+				break;
+			case IEEE80211_STYPE_ACK:
+				printf("RX: ");
+				print_addr(frame.addr1);
+				break;
+		}
+	}
+	else
+	{
+		printf("RX: ");
+		print_addr(frame.addr1);
+		printf(" TX: ");
+		print_addr(frame.addr2);
+	}
+
+	printf(CNORMAL "\n");
+	fflush(stdout);
 }
 
 void analyze(char* buffer, int size)
@@ -195,18 +248,35 @@ void analyze(char* buffer, int size)
 		print_wifi(frame);
 }
 
-int main()
+int main(int argc, char *argv[])
 {
 	char buffer[BUFSIZE];
 	struct sockaddr saddr;
-	if (sock_open()) return 0;
+	int opt;
 
+	while ((opt = getopt(argc, argv, "ilw") != -1))
+	{
+		switch (opt)
+		{
+		default:
+			fprintf(stderr, "Usage: %s [-ilw] [interface]\n", argv[0]);
+			exit(EXIT_FAILURE);
+		}
+	}
+
+	if (optind >= argc)
+	{
+		fprintf(stderr, "Usage: %s [-ilw] [interface]\n", argv[0]);
+		exit(EXIT_FAILURE);
+	}
+
+	if (sock_open()) return 0;
+	if (sock_bind(argv[optind])) return 0;
 	for(;;) {
 		socklen_t saddr_size = sizeof saddr;
 		int size = recvfrom(sock, buffer, BUFSIZE, 0, &saddr, &saddr_size);
 		analyze(buffer, size);
 	}
-
 	sock_close();
 	return 0;
 }
