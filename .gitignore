@@ -1,3 +1,6 @@
+wifi-sniff
+run.sh
+
 # Object files
 *.o
 *.ko
