@@ -2,6 +2,7 @@
 #include <sys/types.h>
 #include <sys/ioctl.h>
 #include <errno.h>
+#include <time.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,6 +13,12 @@
 #include <net/if.h>
 
 #define BUFSIZE 2048
+#define USAGE "Usage: %s [-dht] [interface]\n"
+#define HELP USAGE "\nSimple wifi interface monitoring\n\n" \
+"  -d                         include differential timestamps\n" \
+"  -h                         display this help and exit\n" \
+"  -t                         include timestamps\n" \
+""
 #define IEEE80211_FTYPE_MGMT            0x0000
 #define IEEE80211_FTYPE_CTL             0x0004
 #define IEEE80211_FTYPE_DATA            0x0008
@@ -50,6 +57,10 @@
 
 int sock;
 
+bool opt_timestamp = false;
+bool opt_diffstamp = false;
+clock_t lastts = 0;
+
 struct wdata
 {
 
@@ -62,6 +73,7 @@ struct wmgmt_assoc {};
 struct wframe
 {
 	bool nowifi;
+	int ts, diffts;
 	int type;
 	int stype;
 	uint16_t nav; //nav in usec
@@ -88,6 +100,18 @@ const char * subtype_name(int type, int stype)
 	else if (type == IEEE80211_FTYPE_MGMT) {
 		if (stype == IEEE80211_STYPE_BEACON)
 			return "Beacon";
+		if (stype == IEEE80211_STYPE_PROBE_REQ)
+			return "Probe Req";
+		if (stype == IEEE80211_STYPE_PROBE_RESP)
+			return "Probe Resp";
+		if (stype == IEEE80211_STYPE_ASSOC_REQ)
+			return "Assoc Req";
+		if (stype == IEEE80211_STYPE_ASSOC_RESP)
+			return "Assoc Resp";
+		if (stype == IEEE80211_STYPE_AUTH)
+			return "Auth";
+		if (stype == IEEE80211_STYPE_DEAUTH)
+			return "Deauth";
 		else
 			return "Unknown Management";
 	}
@@ -148,6 +172,10 @@ struct wframe buffertowframe(char * buffer, int size)
 	struct wframe frame;
 	memset(&frame, 0, sizeof(wframe));
 	int pos = 0;
+	clock_t ts = clock();
+	frame.ts = ts;
+	frame.diffts = ts - lastts;
+	lastts = ts;
 	uint8_t radiotap_version = buffer[pos++];
 	uint8_t radiotap_pad = buffer[pos++];
 	uint16_t radiotap_length = buffer[pos];
@@ -191,50 +219,59 @@ FCS:
 	return frame;
 }
 
-void print_nowifi()
+void print_nowifi(struct wframe *frame)
 {
-	printf("Non-wifi packet\n");
+	printf("Non-wifi packet");
+	if(opt_timestamp)
+		printf(" (t %d)", frame->ts);
+	if(opt_diffstamp)
+		printf(" (d %d)", frame->diffts);
+	printf("\n");
 }
 
-void print_wifi(struct wframe frame)
+void print_wifi(struct wframe *frame)
 {
-	if (frame.type == IEEE80211_FTYPE_MGMT)
+	if (frame->type == IEEE80211_FTYPE_MGMT)
 		printf(CYELLOW "M ");
-	else if (frame.type == IEEE80211_FTYPE_CTL)
+	else if (frame->type == IEEE80211_FTYPE_CTL)
 		printf(CCYAN "C ");
-	else if (frame.type == IEEE80211_FTYPE_DATA)
+	else if (frame->type == IEEE80211_FTYPE_DATA)
 		printf(CWHITE "D ");
 
-	printf("%s ", subtype_name(frame.type, frame.stype));
+	printf("%s ", subtype_name(frame->type, frame->stype));
 
-	if (frame.type == IEEE80211_FTYPE_CTL)
+	if (frame->type == IEEE80211_FTYPE_CTL)
 	{
-		switch (frame.stype)
+		switch (frame->stype)
 		{
 			case IEEE80211_STYPE_RTS:
 				printf("RX: ");
-				print_addr(frame.addr1);
+				print_addr(frame->addr1);
 				printf(" TX: ");
-				print_addr(frame.addr2);
+				print_addr(frame->addr2);
 				break;
 			case IEEE80211_STYPE_CTS:
 				printf("RX: ");
-				print_addr(frame.addr1);
+				print_addr(frame->addr1);
 				break;
 			case IEEE80211_STYPE_ACK:
 				printf("RX: ");
-				print_addr(frame.addr1);
+				print_addr(frame->addr1);
 				break;
 		}
 	}
 	else
 	{
 		printf("RX: ");
-		print_addr(frame.addr1);
+		print_addr(frame->addr1);
 		printf(" TX: ");
-		print_addr(frame.addr2);
+		print_addr(frame->addr2);
 	}
 
+	if (opt_timestamp)
+		printf(" (t %d)", frame->ts);
+	if (opt_diffstamp)
+		printf(" (d %d)", frame->diffts);
 	printf(CNORMAL "\n");
 	fflush(stdout);
 }
@@ -243,9 +280,9 @@ void analyze(char* buffer, int size)
 {
 	wframe frame = buffertowframe(buffer, size);
 	if(frame.nowifi)
-		print_nowifi();
+		print_nowifi(&frame);
 	else
-		print_wifi(frame);
+		print_wifi(&frame);
 }
 
 int main(int argc, char *argv[])
@@ -254,19 +291,28 @@ int main(int argc, char *argv[])
 	struct sockaddr saddr;
 	int opt;
 
-	while ((opt = getopt(argc, argv, "ilw") != -1))
+	while ((opt = getopt(argc, argv, "tdh")) != -1)
 	{
 		switch (opt)
 		{
-		default:
-			fprintf(stderr, "Usage: %s [-ilw] [interface]\n", argv[0]);
-			exit(EXIT_FAILURE);
+			case 'h':
+				fprintf(stdout, HELP, argv[0]);
+				exit(EXIT_SUCCESS);
+			case 'd':
+				opt_diffstamp = true;
+				break;
+			case 't':
+				opt_timestamp = true;
+				break;
+			default:
+				fprintf(stderr, USAGE, argv[0]);
+				exit(EXIT_FAILURE);
 		}
 	}
 
 	if (optind >= argc)
 	{
-		fprintf(stderr, "Usage: %s [-ilw] [interface]\n", argv[0]);
+		fprintf(stderr, USAGE, argv[0]);
 		exit(EXIT_FAILURE);
 	}
 
