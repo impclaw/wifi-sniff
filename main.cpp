@@ -13,10 +13,13 @@
 #include <net/if.h>
 
 #define BUFSIZE 2048
-#define USAGE "Usage: %s [-dht] [interface]\n"
+#define PARAMS "cdhst"
+#define USAGE "Usage: %s [-" PARAMS "] [interface]\n"
 #define HELP USAGE "\nSimple wifi interface monitoring\n\n" \
+"  -c                         enables colors\n" \
 "  -d                         include differential timestamps\n" \
 "  -h                         display this help and exit\n" \
+"  -s                         simple names\n" \
 "  -t                         include timestamps\n" \
 ""
 #define IEEE80211_FTYPE_MGMT            0x0000
@@ -55,10 +58,15 @@
 #define CCYAN    "\033[36m"
 #define CWHITE   "\033[37m"
 
+//char * colors[] = {CRED, CGREEN, CYELLOW, CBLUE, CMAGENTA, CCYAN, CWHITE};
+
 int sock;
 
 bool opt_timestamp = false;
 bool opt_diffstamp = false;
+bool opt_simpleaddr = false;
+bool opt_color = false;
+int ccolor = 0;
 clock_t lastts = 0;
 
 struct wdata
@@ -70,6 +78,36 @@ struct wmgmt_beacon {};
 struct wmgmt_auth {};
 struct wmgmt_assoc {};
 
+struct station
+{
+	int color;
+	unsigned char addr[6];
+	struct station * next;
+};
+struct station * sta_head = NULL;
+
+void sta_add(struct station ** head, int color, unsigned char * addr)
+{
+	if (*head == NULL)
+	{
+		*head = (struct station*)malloc(sizeof(station));
+		(*head)->color = color;
+		(*head)->next = NULL;
+		memcpy((*head)->addr, addr, 6);
+	} else sta_add(&((*head)->next), color, addr);
+}
+
+struct station* sta_find(struct station * head, unsigned char addr[6])
+{
+	if(head == NULL) return NULL;
+	//else if (head->addr != NULL && memcmp(head->addr, addr, 6)) return head;
+	else if (head->addr != NULL && memcmp(head->addr, addr, 6) == 0) return head;
+	else return sta_find(head->next, addr);
+}
+
+
+
+
 struct wframe
 {
 	bool nowifi;
@@ -80,6 +118,10 @@ struct wframe
 	unsigned char addr1[6];
 	unsigned char addr2[6];
 	unsigned char addr3[6];
+	unsigned char* rxaddr;
+	struct station * rxsta;
+	unsigned char* txaddr;
+	struct station * txsta;
 
 	bool retry;
 	bool powermgmt;
@@ -216,6 +258,51 @@ struct wframe buffertowframe(char * buffer, int size)
 FCS:
 	pos += 2; //TODO: Parse sequence number (fcs)
 
+	if (frame.type == IEEE80211_FTYPE_CTL)
+	{
+		switch (frame.stype)
+		{
+			case IEEE80211_STYPE_RTS:
+				frame.rxaddr = frame.addr1;
+				frame.txaddr = frame.addr2;
+				break;
+			case IEEE80211_STYPE_CTS:
+				frame.rxaddr = frame.addr1;
+				break;
+			case IEEE80211_STYPE_ACK:
+				frame.rxaddr = frame.addr1;
+				break;
+		}
+	}
+	else
+	{
+		frame.rxaddr = frame.addr1;
+		frame.txaddr = frame.addr2;
+	}
+
+	if(frame.txaddr != NULL)
+	{
+		struct station * sta = sta_find(sta_head, frame.txaddr);
+		if (sta != NULL)
+			frame.txsta = sta;
+		else
+		{
+			sta_add(&sta_head, ccolor++, frame.txaddr);
+			frame.txsta = sta_find(sta_head, frame.txaddr);
+		}
+	}
+	if(frame.rxaddr != NULL)
+	{
+		struct station * sta = sta_find(sta_head, frame.rxaddr);
+		if (sta != NULL)
+			frame.rxsta = sta;
+		else
+		{
+			sta_add(&sta_head, ccolor++, frame.rxaddr);
+			frame.rxsta = sta_find(sta_head, frame.rxaddr);
+		}
+	}
+
 	return frame;
 }
 
@@ -229,50 +316,73 @@ void print_nowifi(struct wframe *frame)
 	printf("\n");
 }
 
-void print_wifi(struct wframe *frame)
+void print_colormark(int color)
 {
-	if (frame->type == IEEE80211_FTYPE_MGMT)
-		printf(CYELLOW "M ");
-	else if (frame->type == IEEE80211_FTYPE_CTL)
-		printf(CCYAN "C ");
-	else if (frame->type == IEEE80211_FTYPE_DATA)
-		printf(CWHITE "D ");
-
-	printf("%s ", subtype_name(frame->type, frame->stype));
-
-	if (frame->type == IEEE80211_FTYPE_CTL)
+	if (opt_color)
 	{
-		switch (frame->stype)
+		switch (color % 6)
 		{
-			case IEEE80211_STYPE_RTS:
-				printf("RX: ");
-				print_addr(frame->addr1);
-				printf(" TX: ");
-				print_addr(frame->addr2);
-				break;
-			case IEEE80211_STYPE_CTS:
-				printf("RX: ");
-				print_addr(frame->addr1);
-				break;
-			case IEEE80211_STYPE_ACK:
-				printf("RX: ");
-				print_addr(frame->addr1);
-				break;
+			case 0: printf(CRED); break;
+			case 1: printf(CGREEN); break;
+			case 2: printf(CYELLOW); break;
+			case 3: printf(CBLUE); break;
+			case 4: printf(CMAGENTA); break;
+			case 5: printf(CCYAN); break;
 		}
+	}
+}
+void reset_colormark()
+{
+	if (opt_color)
+		printf(CWHITE);
+}
+
+void print_node(struct station *sta)
+{
+	if (sta->color != 0)
+		print_colormark(sta->color);
+	if (opt_simpleaddr)
+	{
+		if (sta->color == 0)
+			printf("Broadcast");
+		else
+			printf("Node %c", sta->color+64);
 	}
 	else
 	{
-		printf("RX: ");
-		print_addr(frame->addr1);
-		printf(" TX: ");
-		print_addr(frame->addr2);
+		if (sta->color == 0)
+			printf("Broadcast");
+		else
+			print_addr(sta->addr);
 	}
+	reset_colormark();
+}
 
+void print_wifi(struct wframe *frame)
+{
+	if(frame->txsta != NULL)
+	{
+		print_node(frame->txsta);
+		printf(" sent ");
+	}
+	else printf("someone sent ");
+
+	printf("%-12s ", subtype_name(frame->type, frame->stype));
+
+	if(frame->rxsta != NULL)
+	{
+		printf("-> ");
+		print_node(frame->rxsta);
+	}
+	else printf("-> someone ");
+
+
+	reset_colormark();
 	if (opt_timestamp)
 		printf(" (t %d)", frame->ts);
 	if (opt_diffstamp)
 		printf(" (d %d)", frame->diffts);
-	printf(CNORMAL "\n");
+	printf("\n");
 	fflush(stdout);
 }
 
@@ -291,15 +401,24 @@ int main(int argc, char *argv[])
 	struct sockaddr saddr;
 	int opt;
 
-	while ((opt = getopt(argc, argv, "tdh")) != -1)
+	unsigned char bcast[] = "\xFF\xFF\xFF\xFF\xFF\xFF";
+	sta_add(&sta_head, ccolor++, bcast);
+
+	while ((opt = getopt(argc, argv, PARAMS)) != -1)
 	{
 		switch (opt)
 		{
 			case 'h':
 				fprintf(stdout, HELP, argv[0]);
 				exit(EXIT_SUCCESS);
+			case 'c':
+				opt_color = true;
+				break;
 			case 'd':
 				opt_diffstamp = true;
+				break;
+			case 's':
+				opt_simpleaddr = true;
 				break;
 			case 't':
 				opt_timestamp = true;
@@ -323,6 +442,7 @@ int main(int argc, char *argv[])
 		int size = recvfrom(sock, buffer, BUFSIZE, 0, &saddr, &saddr_size);
 		analyze(buffer, size);
 	}
+	printf(CNORMAL);
 	sock_close();
 	return 0;
 }
