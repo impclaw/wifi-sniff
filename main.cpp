@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <time.h>
 #include <string.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -16,11 +17,11 @@
 #define PARAMS "cdhst"
 #define USAGE "Usage: %s [-" PARAMS "] [interface]\n"
 #define HELP USAGE "\nSimple wifi interface monitoring\n\n" \
-"  -c                         enables colors\n" \
-"  -d                         include differential timestamps\n" \
-"  -h                         display this help and exit\n" \
-"  -s                         simple names\n" \
-"  -t                         include timestamps\n" \
+"  -c    enables colors\n" \
+"  -d    include differential timestamps\n" \
+"  -h    display this help and exit\n" \
+"  -s    simple names\n" \
+"  -t    include timestamps\n" \
 ""
 #define IEEE80211_FTYPE_MGMT            0x0000
 #define IEEE80211_FTYPE_CTL             0x0004
@@ -82,6 +83,8 @@ struct station
 {
 	int color;
 	unsigned char addr[6];
+	int txcount;
+	int rxcount;
 	struct station * next;
 };
 struct station * sta_head = NULL;
@@ -91,6 +94,7 @@ void sta_add(struct station ** head, int color, unsigned char * addr)
 	if (*head == NULL)
 	{
 		*head = (struct station*)malloc(sizeof(station));
+		memset(*head, 0, sizeof(station));
 		(*head)->color = color;
 		(*head)->next = NULL;
 		memcpy((*head)->addr, addr, 6);
@@ -126,6 +130,13 @@ struct wframe
 	bool retry;
 	bool powermgmt;
 };
+
+static bool keepRunning = true;
+
+void intHandler(int dummy = 0) 
+{
+    keepRunning = false;
+}
 
 const char * subtype_name(int type, int stype)
 {
@@ -290,6 +301,7 @@ FCS:
 			sta_add(&sta_head, ccolor++, frame.txaddr);
 			frame.txsta = sta_find(sta_head, frame.txaddr);
 		}
+		frame.txsta->txcount++;
 	}
 	if(frame.rxaddr != NULL)
 	{
@@ -301,6 +313,7 @@ FCS:
 			sta_add(&sta_head, ccolor++, frame.rxaddr);
 			frame.rxsta = sta_find(sta_head, frame.rxaddr);
 		}
+		frame.txsta->rxcount++;
 	}
 
 	return frame;
@@ -395,14 +408,31 @@ void analyze(char* buffer, int size)
 		print_wifi(&frame);
 }
 
+void print_stalist(struct station * head)
+{
+	if(head == NULL) return;
+	bool old = opt_simpleaddr;
+	opt_simpleaddr = true;
+	print_node(head);
+	printf(" = ");
+	opt_simpleaddr = false;
+	print_node(head);
+	printf(" (tx: %d, rx: %d)", head->txcount, head->rxcount);
+	printf("\n");
+	opt_simpleaddr = old;
+	print_stalist(head->next);
+}
+
 int main(int argc, char *argv[])
 {
 	char buffer[BUFSIZE];
 	struct sockaddr saddr;
 	int opt;
+	clock_t starttime = clock();
 
 	unsigned char bcast[] = "\xFF\xFF\xFF\xFF\xFF\xFF";
 	sta_add(&sta_head, ccolor++, bcast);
+	signal(SIGINT, intHandler);
 
 	while ((opt = getopt(argc, argv, PARAMS)) != -1)
 	{
@@ -437,13 +467,17 @@ int main(int argc, char *argv[])
 
 	if (sock_open()) return 0;
 	if (sock_bind(argv[optind])) return 0;
-	for(;;) {
+	while(keepRunning) {
 		socklen_t saddr_size = sizeof saddr;
 		int size = recvfrom(sock, buffer, BUFSIZE, 0, &saddr, &saddr_size);
 		analyze(buffer, size);
 	}
+	clock_t endtime = clock();
 	printf(CNORMAL);
 	sock_close();
+	printf("Station List: \n");
+	print_stalist(sta_head->next);
+	printf("Total Running Time: %f\n", (((float)(endtime - starttime)) / CLOCKS_PER_SEC));
 	return 0;
 }
 
