@@ -138,6 +138,19 @@ void intHandler(int dummy = 0)
     keepRunning = false;
 }
 
+timespec tsdiff(timespec start, timespec end)
+{
+	timespec temp;
+	if ((end.tv_nsec-start.tv_nsec)<0) {
+		temp.tv_sec = end.tv_sec-start.tv_sec-1;
+		temp.tv_nsec = 1000000000+end.tv_nsec-start.tv_nsec;
+	} else {
+		temp.tv_sec = end.tv_sec-start.tv_sec;
+		temp.tv_nsec = end.tv_nsec-start.tv_nsec;
+	}
+	return temp;
+}
+
 const char * subtype_name(int type, int stype)
 {
 	if (type == IEEE80211_FTYPE_CTL) {
@@ -313,7 +326,7 @@ FCS:
 			sta_add(&sta_head, ccolor++, frame.rxaddr);
 			frame.rxsta = sta_find(sta_head, frame.rxaddr);
 		}
-		frame.txsta->rxcount++;
+		frame.rxsta->rxcount++;
 	}
 
 	return frame;
@@ -428,7 +441,8 @@ int main(int argc, char *argv[])
 	char buffer[BUFSIZE];
 	struct sockaddr saddr;
 	int opt;
-	clock_t starttime = clock();
+	timespec starttime, endtime;
+	clock_gettime(CLOCK_MONOTONIC, &starttime);
 
 	unsigned char bcast[] = "\xFF\xFF\xFF\xFF\xFF\xFF";
 	sta_add(&sta_head, ccolor++, bcast);
@@ -472,12 +486,13 @@ int main(int argc, char *argv[])
 		int size = recvfrom(sock, buffer, BUFSIZE, 0, &saddr, &saddr_size);
 		analyze(buffer, size);
 	}
-	clock_t endtime = clock();
+	clock_gettime(CLOCK_MONOTONIC, &endtime);
 	printf(CNORMAL);
 	sock_close();
 	printf("Station List: \n");
 	print_stalist(sta_head->next);
-	printf("Total Running Time: %f\n", (((float)(endtime - starttime)) / CLOCKS_PER_SEC));
+	timespec ts = tsdiff(starttime, endtime);
+	printf("Total Running Time: %ld.%lds\n", ts.tv_sec, ts.tv_nsec / 1000);
 	return 0;
 }
 
