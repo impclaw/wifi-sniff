@@ -15,8 +15,10 @@
 
 #define BUFSIZE 2048
 #define PARAMS "cdhst"
-#define USAGE "Usage: %s [-" PARAMS "] [interface]\n"
+#define USAGE "Usage: %s [-" PARAMS "] [interface] [maclist...]\n"
 #define HELP USAGE "\nSimple wifi interface monitoring\n\n" \
+"[maclist...] which mac addresses to monitor, empty = all\n" \
+"[interface]  which interface to monitor\n" \
 "  -c    enables colors\n" \
 "  -d    include differential timestamps\n" \
 "  -h    display this help and exit\n" \
@@ -70,14 +72,18 @@ bool opt_color = false;
 int ccolor = 0;
 clock_t lastts = 0;
 
-struct wdata
+int maclist_count;
+unsigned char * maclist = NULL; //contains mac list
+
+bool isinmaclist(unsigned char * addr)
 {
-
-};
-
-struct wmgmt_beacon {};
-struct wmgmt_auth {};
-struct wmgmt_assoc {};
+	if(maclist == NULL) return true;
+	for(int i = 0; i < maclist_count; i++)
+	{
+		if(memcmp(maclist + i*6, addr, 6) == 0) return true;
+	}
+	return false;
+}
 
 struct station
 {
@@ -104,7 +110,6 @@ void sta_add(struct station ** head, int color, unsigned char * addr)
 struct station* sta_find(struct station * head, unsigned char addr[6])
 {
 	if(head == NULL) return NULL;
-	//else if (head->addr != NULL && memcmp(head->addr, addr, 6)) return head;
 	else if (head->addr != NULL && memcmp(head->addr, addr, 6) == 0) return head;
 	else return sta_find(head->next, addr);
 }
@@ -386,6 +391,8 @@ void print_node(struct station *sta)
 
 void print_wifi(struct wframe *frame)
 {
+	if(!isinmaclist(frame->txaddr) && !isinmaclist(frame->rxaddr))
+		return;
 	if(frame->txsta != NULL)
 	{
 		print_node(frame->txsta);
@@ -424,15 +431,18 @@ void analyze(char* buffer, int size)
 void print_stalist(struct station * head)
 {
 	if(head == NULL) return;
-	bool old = opt_simpleaddr;
-	opt_simpleaddr = true;
-	print_node(head);
-	printf(" = ");
-	opt_simpleaddr = false;
-	print_node(head);
-	printf(" (tx: %d, rx: %d)", head->txcount, head->rxcount);
-	printf("\n");
-	opt_simpleaddr = old;
+	if(isinmaclist(head->addr))
+	{
+		bool old = opt_simpleaddr;
+		opt_simpleaddr = true;
+		print_node(head);
+		printf(" = ");
+		opt_simpleaddr = false;
+		print_node(head);
+		printf(" (tx: %d, rx: %d)", head->txcount, head->rxcount);
+		printf("\n");
+		opt_simpleaddr = old;
+	}
 	print_stalist(head->next);
 }
 
@@ -478,6 +488,26 @@ int main(int argc, char *argv[])
 		fprintf(stderr, USAGE, argv[0]);
 		exit(EXIT_FAILURE);
 	}
+
+	char * iface = argv[optind];
+	int macs = argc - optind - 1;
+	if(macs > 0)
+	{
+		maclist = (unsigned char*)malloc(6*macs);
+		unsigned char * pos = maclist;
+		for(int i = optind + 1; i < argc; i++)
+		{
+			unsigned int iMac[6];
+			unsigned char mac[6];
+
+			sscanf(argv[i], "%x:%x:%x:%x:%x:%x", &iMac[0], &iMac[1], &iMac[2], &iMac[3], &iMac[4], &iMac[5]);
+			for(int j=0;j<6;j++)
+				mac[j] = (unsigned char)iMac[j];
+			memcpy(pos, mac, 6);
+			pos += 6;
+		}
+	}
+	maclist_count = macs;
 
 	if (sock_open()) return 0;
 	if (sock_bind(argv[optind])) return 0;
