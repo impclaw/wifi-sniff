@@ -140,6 +140,8 @@ static bool keepRunning = true;
 
 void intHandler(int dummy = 0) 
 {
+	if(keepRunning == false)
+		exit(0);
     keepRunning = false;
 }
 
