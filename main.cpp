@@ -114,9 +114,6 @@ struct station* sta_find(struct station * head, unsigned char addr[6])
 	else return sta_find(head->next, addr);
 }
 
-
-
-
 struct wframe
 {
 	bool nowifi;
@@ -138,10 +135,16 @@ struct wframe
 
 static bool keepRunning = true;
 
+void print_stalist(struct station*);
+
 void intHandler(int dummy = 0) 
 {
 	if(keepRunning == false)
+	{
+		printf("Station List: \n");
+		print_stalist(sta_head->next);
 		exit(0);
+	}
     keepRunning = false;
 }
 
