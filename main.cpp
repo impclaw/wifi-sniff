@@ -21,11 +21,11 @@
 "[interface]  which interface to monitor\n" \
 "  -b    don't output beacon frames\n" \
 "  -c    enables colors\n" \
-"  -d    include differential timestamps\n" \
+"  -d    include differential timestamps (inaccurate)\n" \
 "  -h    display this help and exit\n" \
 "  -m    don't output management frames\n" \
 "  -s    simple names\n" \
-"  -t    include timestamps\n" \
+"  -t    include timestamps (inaccurate)\n" \
 ""
 #define IEEE80211_FTYPE_MGMT            0x0000
 #define IEEE80211_FTYPE_CTL             0x0004
@@ -95,6 +95,7 @@ struct station
 	unsigned char addr[6];
 	int txcount;
 	int rxcount;
+	char *ssid;
 	struct station * next;
 };
 struct station * sta_head = NULL;
@@ -136,6 +137,12 @@ struct wframe
 	bool retry;
 	bool powermgmt;
 };
+
+bool isbeacon(struct wframe* f)
+{
+	return f->type == IEEE80211_FTYPE_MGMT && 
+	       f->stype == IEEE80211_STYPE_BEACON;
+}
 
 static bool keepRunning = true;
 
@@ -297,10 +304,13 @@ struct wframe * buffertowframe(char * buffer, int size)
 FCS:
 	pos += 2; //TODO: Parse sequence number (fcs)
 
+
 	if(opt_nobeacon && frame->type == IEEE80211_FTYPE_MGMT && frame->stype == IEEE80211_STYPE_BEACON)
 		return NULL;
 	if(opt_nomgmt && frame->type == IEEE80211_FTYPE_MGMT)
 		return NULL;
+
+
 
 	if (frame->type == IEEE80211_FTYPE_CTL)
 	{
@@ -349,6 +359,24 @@ FCS:
 		frame->rxsta->rxcount++;
 	}
 
+	if(frame->type == IEEE80211_FTYPE_MGMT)
+	{
+		if(frame->stype == IEEE80211_STYPE_BEACON)
+		{
+			if(frame->txsta->ssid == NULL)
+			{
+				int bpos = pos+12;
+				if(buffer[bpos] == 0)
+				{
+					int len = buffer[bpos+1];
+					frame->txsta->ssid = (char*) malloc(len+1);
+					memcpy(frame->txsta->ssid, buffer + bpos + 2, len);
+					frame->txsta->ssid[len] = '\0';
+				}
+			}
+		}
+	}
+
 	return frame;
 }
 
@@ -391,8 +419,10 @@ void print_node(struct station *sta)
 	{
 		if (sta->color == 0)
 			printf("Broadcast");
+		else if (sta->ssid != NULL)
+			printf("%8.8s", sta->ssid);
 		else
-			printf("Node %c", sta->color+64);
+			printf("Node %c  ", sta->color+64);
 	}
 	else
 	{
@@ -458,6 +488,8 @@ void print_stalist(struct station * head)
 		printf(" = ");
 		opt_simpleaddr = false;
 		print_node(head);
+		if(head->ssid)
+			printf(" [%s]", head->ssid);
 		printf(" (tx: %d, rx: %d)", head->txcount, head->rxcount);
 		printf("\n");
 		opt_simpleaddr = old;
