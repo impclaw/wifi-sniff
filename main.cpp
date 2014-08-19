@@ -14,14 +14,16 @@
 #include <net/if.h>
 
 #define BUFSIZE 2048
-#define PARAMS "cdhst"
+#define PARAMS "bcdhst"
 #define USAGE "Usage: %s [-" PARAMS "] [interface] [maclist...]\n"
 #define HELP USAGE "\nSimple wifi interface monitoring\n\n" \
 "[maclist...] which mac addresses to monitor, empty = all\n" \
 "[interface]  which interface to monitor\n" \
+"  -b    don't output beacon frames\n" \
 "  -c    enables colors\n" \
 "  -d    include differential timestamps\n" \
 "  -h    display this help and exit\n" \
+"  -m    don't output management frames\n" \
 "  -s    simple names\n" \
 "  -t    include timestamps\n" \
 ""
@@ -68,6 +70,8 @@ int sock;
 bool opt_timestamp = false;
 bool opt_diffstamp = false;
 bool opt_simpleaddr = false;
+bool opt_nobeacon = false;
+bool opt_nomgmt = false;
 bool opt_color = false;
 int ccolor = 0;
 clock_t lastts = 0;
@@ -241,22 +245,23 @@ void print_addr(unsigned char* addr)
 		i == 5 ? printf("%02x", addr[i]) : printf("%02x:", addr[i]);
 }
 
-struct wframe buffertowframe(char * buffer, int size)
+struct wframe * buffertowframe(char * buffer, int size)
 {
 	//Let's process the packet. 
 	//First remove radiotap. 
-	struct wframe frame;
-	memset(&frame, 0, sizeof(wframe));
+	struct wframe *frame;
+	frame = (struct wframe *) malloc(sizeof(struct wframe));
+	memset(frame, 0, sizeof(wframe));
 	int pos = 0;
 	clock_t ts = clock();
-	frame.ts = ts;
-	frame.diffts = ts - lastts;
+	frame->ts = ts;
+	frame->diffts = ts - lastts;
 	lastts = ts;
 	uint8_t radiotap_version = buffer[pos++];
 	uint8_t radiotap_pad = buffer[pos++];
 	uint16_t radiotap_length = buffer[pos];
 	if (radiotap_version != 0 || radiotap_pad != 0 || radiotap_length > 1000) {
-		frame.nowifi = true;
+		frame->nowifi = true;
 		return frame;
 	}
 
@@ -266,77 +271,82 @@ struct wframe buffertowframe(char * buffer, int size)
 	//Decode packet type
 	uint16_t fc = buffer[pos]; //frame control info
 	pos += 2;
-	if((fc & 0x04) != 0) frame.type  += 0x2;
-	if((fc & 0x08) != 0) frame.type  += 0x1;
-	if((fc & 0x10) != 0) frame.stype += 0x1;
-	if((fc & 0x20) != 0) frame.stype += 0x2;
-	if((fc & 0x40) != 0) frame.stype += 0x4;
-	if((fc & 0x80) != 0) frame.stype += 0x8;
-	frame.retry = (fc & 0x400);
-	frame.powermgmt = (fc & 0x800);
-	frame.nav = buffer[pos];
+	if((fc & 0x04) != 0) frame->type  += 0x2;
+	if((fc & 0x08) != 0) frame->type  += 0x1;
+	if((fc & 0x10) != 0) frame->stype += 0x1;
+	if((fc & 0x20) != 0) frame->stype += 0x2;
+	if((fc & 0x40) != 0) frame->stype += 0x4;
+	if((fc & 0x80) != 0) frame->stype += 0x8;
+	frame->retry = (fc & 0x400);
+	frame->powermgmt = (fc & 0x800);
+	frame->nav = buffer[pos];
 	pos += 2;
-	memcpy(&frame.addr1, buffer+pos, 6); //This address is always there
+	memcpy(&frame->addr1, buffer+pos, 6); //This address is always there
 	pos += 6;
-	if (frame.type == IEEE80211_FTYPE_CTL)
-		if (frame.type == IEEE80211_STYPE_CTS || 
-		    frame.type == IEEE80211_STYPE_ACK)
+	if (frame->type == IEEE80211_FTYPE_CTL)
+		if (frame->type == IEEE80211_STYPE_CTS || 
+		    frame->type == IEEE80211_STYPE_ACK)
 			goto FCS;
-	memcpy(&frame.addr2, buffer+pos, 6);
+	memcpy(&frame->addr2, buffer+pos, 6);
 	pos += 6;
-	if (frame.type == IEEE80211_FTYPE_CTL)
+	if (frame->type == IEEE80211_FTYPE_CTL)
 		goto FCS;
-	memcpy(&frame.addr3, buffer+pos, 6);
+	memcpy(&frame->addr3, buffer+pos, 6);
 	pos += 6;
 
 FCS:
 	pos += 2; //TODO: Parse sequence number (fcs)
 
-	if (frame.type == IEEE80211_FTYPE_CTL)
+	if(opt_nobeacon && frame->type == IEEE80211_FTYPE_MGMT && frame->stype == IEEE80211_STYPE_BEACON)
+		return NULL;
+	if(opt_nomgmt && frame->type == IEEE80211_FTYPE_MGMT)
+		return NULL;
+
+	if (frame->type == IEEE80211_FTYPE_CTL)
 	{
-		switch (frame.stype)
+		switch (frame->stype)
 		{
 			case IEEE80211_STYPE_RTS:
-				frame.rxaddr = frame.addr1;
-				frame.txaddr = frame.addr2;
+				frame->rxaddr = frame->addr1;
+				frame->txaddr = frame->addr2;
 				break;
 			case IEEE80211_STYPE_CTS:
-				frame.rxaddr = frame.addr1;
+				frame->rxaddr = frame->addr1;
 				break;
 			case IEEE80211_STYPE_ACK:
-				frame.rxaddr = frame.addr1;
+				frame->rxaddr = frame->addr1;
 				break;
 		}
 	}
 	else
 	{
-		frame.rxaddr = frame.addr1;
-		frame.txaddr = frame.addr2;
+		frame->rxaddr = frame->addr1;
+		frame->txaddr = frame->addr2;
 	}
 
-	if(frame.txaddr != NULL)
+	if(frame->txaddr != NULL)
 	{
-		struct station * sta = sta_find(sta_head, frame.txaddr);
+		struct station * sta = sta_find(sta_head, frame->txaddr);
 		if (sta != NULL)
-			frame.txsta = sta;
+			frame->txsta = sta;
 		else
 		{
-			sta_add(&sta_head, ccolor++, frame.txaddr);
-			frame.txsta = sta_find(sta_head, frame.txaddr);
+			sta_add(&sta_head, ccolor++, frame->txaddr);
+			frame->txsta = sta_find(sta_head, frame->txaddr);
 		}
-		frame.txsta->txcount++;
+		frame->txsta->txcount++;
 	}
-	if(frame.rxaddr != NULL)
+	if(frame->rxaddr != NULL)
 	{
-		struct station * sta = sta_find(sta_head, frame.rxaddr);
+		struct station * sta = sta_find(sta_head, frame->rxaddr);
 		if (sta != NULL)
-			frame.rxsta = sta;
+			frame->rxsta = sta;
 		else
 		{
-			sta_add(&sta_head, ccolor++, frame.rxaddr);
-			frame.rxsta = sta_find(sta_head, frame.rxaddr);
+			sta_add(&sta_head, ccolor++, frame->rxaddr);
+			frame->rxsta = sta_find(sta_head, frame->rxaddr);
 		}
-		frame.rxsta->rxcount++;
+		frame->rxsta->rxcount++;
 	}
 
 	return frame;
@@ -398,6 +408,7 @@ void print_wifi(struct wframe *frame)
 {
 	if(!isinmaclist(frame->txaddr) && !isinmaclist(frame->rxaddr))
 		return;
+
 	if(frame->txsta != NULL)
 	{
 		print_node(frame->txsta);
@@ -426,11 +437,14 @@ void print_wifi(struct wframe *frame)
 
 void analyze(char* buffer, int size)
 {
-	wframe frame = buffertowframe(buffer, size);
-	if(frame.nowifi)
-		print_nowifi(&frame);
+	struct wframe *frame = buffertowframe(buffer, size);
+	if(frame == NULL)
+		return;
+	if(frame->nowifi)
+		print_nowifi(frame);
 	else
-		print_wifi(&frame);
+		print_wifi(frame);
+	free(frame);
 }
 
 void print_stalist(struct station * head)
@@ -470,11 +484,17 @@ int main(int argc, char *argv[])
 			case 'h':
 				fprintf(stdout, HELP, argv[0]);
 				exit(EXIT_SUCCESS);
+			case 'b':
+				opt_nobeacon = true;
+				break;
 			case 'c':
 				opt_color = true;
 				break;
 			case 'd':
 				opt_diffstamp = true;
+				break;
+			case 'm':
+				opt_nomgmt = true;
 				break;
 			case 's':
 				opt_simpleaddr = true;
