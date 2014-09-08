@@ -15,7 +15,7 @@
 
 #define BUFSIZE 2048
 #define PARAMS "h"
-#define USAGE "Usage: %s [-" PARAMS "] [interface] [maclist...]\n"
+#define USAGE "Usage: %s [-" PARAMS "] [managed if] [monitor if] [ssid]\n"
 #define HELP USAGE "\nSimple wifi interface monitoring\n\n" \
 "[maclist...] which mac addresses to monitor, empty = all\n" \
 "[interface]  which interface to monitor\n" \
@@ -35,8 +35,12 @@
 #define CWHITE   "\033[37m"
 
 //char * colors[] = {CRED, CGREEN, CYELLOW, CBLUE, CMAGENTA, CCYAN, CWHITE};
+typedef int bool;
+#define true 1
+#define false 0
 
-int sock;
+int sock_man;
+int sock_mon;
 
 int maclist_count;
 unsigned char * maclist = NULL; //contains mac list
@@ -60,7 +64,7 @@ struct wframe
 
 static bool keepRunning = true;
 
-void intHandler(int dummy = 0) 
+void intHandler(int dummy) 
 {
 	if(keepRunning == false)
 	{
@@ -69,9 +73,9 @@ void intHandler(int dummy = 0)
     keepRunning = false;
 }
 
-timespec tsdiff(timespec start, timespec end)
+struct timespec tsdiff(struct timespec start, struct timespec end)
 {
-	timespec temp;
+	struct timespec temp;
 	if ((end.tv_nsec-start.tv_nsec)<0) {
 		temp.tv_sec = end.tv_sec-start.tv_sec-1;
 		temp.tv_nsec = 1000000000+end.tv_nsec-start.tv_nsec;
@@ -82,7 +86,7 @@ timespec tsdiff(timespec start, timespec end)
 	return temp;
 }
 
-int sock_bind(const char * ifname) { 
+int sock_bind(int sock, const char * ifname) { 
     struct sockaddr_ll sll;
     struct ifreq ifr; bzero(&sll , sizeof(sll));
     bzero(&ifr , sizeof(ifr)); 
@@ -101,25 +105,26 @@ int sock_bind(const char * ifname) {
         perror("bind: ");
         exit(-1);
     }
-    return 0;
+    return sock;
 }
 
 int sock_open()
 {
-	sock = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
+	int sock = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
 	if(sock == -1) {
 		if(errno == EPERM)
-			printf("You require root priviliges to monitor network data. ");
+			printf("You require root priviliges to monitor network data. \n");
 		else
-			printf("Socket creation failed: %d", errno);
-		return errno;
+			printf("Socket creation failed: %d \n", errno);
+		exit(-1);
 	}
-	return 0;
+	return sock;
 }
 
 void sock_close()
 {
-	close(sock);
+	close(sock_mon);
+	close(sock_man);
 }
 
 void print_addr(unsigned char* addr)
@@ -135,7 +140,7 @@ struct wframe * buffertowframe(char * buffer, int size)
 	//First remove radiotap. 
 	struct wframe *frame;
 	frame = (struct wframe *) malloc(sizeof(struct wframe));
-	memset(frame, 0, sizeof(wframe));
+	memset(frame, 0, sizeof(struct wframe));
 	int pos = 0;
 	clock_t ts = clock();
 	frame->ts = ts;
@@ -190,16 +195,36 @@ void analyze(char* buffer, int size)
 	struct wframe *frame = buffertowframe(buffer, size);
 	if(frame == NULL)
 		return;
-	printf("Frame");
+	printf("Probe Reponse\n");
+	fflush(stdout);
 	free(frame);
+}
+
+int probereq(char* ssid, char** req)
+{
+	//char * req = malloc(BUFSIZE);
+	int sz = 4 + 6*3 + 2;
+	*req = malloc(BUFSIZE);
+	*(req)[0] = 0x40; //Prob Req
+	*(req)[1] = 0x0; //Frame control flags
+	*(req)[2] = 0x0;
+	*(req)[3] = 0x0;
+	int p = 4;
+	*(req)[p++] = 0xFF; *(req)[p++] = 0xFF; *(req)[p++] = 0xFF; *(req)[p++] = 0xFF; *(req)[p++] = 0xFF; *(req)[p++] = 0xFF;
+	*(req)[p++] = 0xDE; *(req)[p++] = 0xAD; *(req)[p++] = 0xBE; *(req)[p++] = 0xEF; *(req)[p++] = 0x00; *(req)[p++] = 0x01;
+	*(req)[p++] = 0xFF; *(req)[p++] = 0xFF; *(req)[p++] = 0xFF; *(req)[p++] = 0xFF; *(req)[p++] = 0xFF; *(req)[p++] = 0xFF;
+	*(req)[p++] = 0x40;
+	*(req)[p++] = 0x48;
+	return sz;
 }
 
 int main(int argc, char *argv[])
 {
 	char buffer[BUFSIZE];
-	struct sockaddr saddr;
+	struct sockaddr saddr_mon;
+	struct sockaddr saddr_man;
 	int opt;
-	timespec starttime, endtime;
+	struct timespec starttime, endtime;
 	clock_gettime(CLOCK_MONOTONIC, &starttime);
 
 	unsigned char bcast[] = "\xFF\xFF\xFF\xFF\xFF\xFF";
@@ -218,44 +243,39 @@ int main(int argc, char *argv[])
 		}
 	}
 
-	if (optind >= argc)
+	if (optind >= argc - 2)
 	{
 		fprintf(stderr, USAGE, argv[0]);
 		exit(EXIT_FAILURE);
 	}
 
-	char * iface = argv[optind];
-	int macs = argc - optind - 1;
-	if(macs > 0)
-	{
-		maclist = (unsigned char*)malloc(6*macs);
-		unsigned char * pos = maclist;
-		for(int i = optind + 1; i < argc; i++)
-		{
-			unsigned int iMac[6];
-			unsigned char mac[6];
+	char * ifaceman = argv[optind];
+	char * ifacemon = argv[optind + 1];
+	char * ssid = argv[optind + 2];
 
-			sscanf(argv[i], "%x:%x:%x:%x:%x:%x", &iMac[0], &iMac[1], &iMac[2], &iMac[3], &iMac[4], &iMac[5]);
-			for(int j=0;j<6;j++)
-				mac[j] = (unsigned char)iMac[j];
-			memcpy(pos, mac, 6);
-			pos += 6;
-		}
-	}
-	maclist_count = macs;
+	sock_man = sock_open();
+	sock_mon = sock_open();
+	sock_man = sock_bind(sock_man, ifaceman);
+	sock_mon = sock_bind(sock_mon, ifacemon);
 
-	if (sock_open()) return 0;
-	if (sock_bind(argv[optind])) return 0;
+	char* pkt;
+	int sz = probereq(ssid, &pkt);
+	printf("pkt: %d\n", pkt[20]);
+	socklen_t saddr_size_man = sizeof saddr_man;
+	int size = send(sock_man, pkt, sz, 0);
+	free(pkt);
+	printf("Probe Req. sent (%d), waiting for response...\n", errno);
+	fflush(stdout);
+
 	while(keepRunning) {
-		socklen_t saddr_size = sizeof saddr;
-		int size = recvfrom(sock, buffer, BUFSIZE, 0, &saddr, &saddr_size);
+		socklen_t saddr_size_mon = sizeof saddr_mon;
+		int size = recvfrom(sock_mon, buffer, BUFSIZE, 0, &saddr_mon, &saddr_size_mon);
 		analyze(buffer, size);
 	}
 	clock_gettime(CLOCK_MONOTONIC, &endtime);
 	printf(CNORMAL);
 	sock_close();
-	printf("Station List: \n");
-	timespec ts = tsdiff(starttime, endtime);
+	struct timespec ts = tsdiff(starttime, endtime);
 	printf("Total Running Time: %ld.%lds\n", ts.tv_sec, ts.tv_nsec / 1000);
 	return 0;
 }

@@ -65,6 +65,10 @@
 
 //char * colors[] = {CRED, CGREEN, CYELLOW, CBLUE, CMAGENTA, CCYAN, CWHITE};
 
+typedef int bool;
+#define true 1
+#define false 0
+
 int sock;
 
 bool opt_timestamp = false;
@@ -104,8 +108,8 @@ void sta_add(struct station ** head, int color, unsigned char * addr)
 {
 	if (*head == NULL)
 	{
-		*head = (struct station*)malloc(sizeof(station));
-		memset(*head, 0, sizeof(station));
+		*head = (struct station*)malloc(sizeof(struct station));
+		memset(*head, 0, sizeof(struct station));
 		(*head)->color = color;
 		(*head)->next = NULL;
 		memcpy((*head)->addr, addr, 6);
@@ -148,7 +152,7 @@ static bool keepRunning = true;
 
 void print_stalist(struct station*);
 
-void intHandler(int dummy = 0) 
+void intHandler(int dummy) 
 {
 	if(keepRunning == false)
 	{
@@ -159,9 +163,9 @@ void intHandler(int dummy = 0)
     keepRunning = false;
 }
 
-timespec tsdiff(timespec start, timespec end)
+struct timespec tsdiff(struct timespec start, struct timespec end)
 {
-	timespec temp;
+	struct timespec temp;
 	if ((end.tv_nsec-start.tv_nsec)<0) {
 		temp.tv_sec = end.tv_sec-start.tv_sec-1;
 		temp.tv_nsec = 1000000000+end.tv_nsec-start.tv_nsec;
@@ -258,7 +262,7 @@ struct wframe * buffertowframe(char * buffer, int size)
 	//First remove radiotap. 
 	struct wframe *frame;
 	frame = (struct wframe *) malloc(sizeof(struct wframe));
-	memset(frame, 0, sizeof(wframe));
+	memset(frame, 0, sizeof(struct wframe));
 	int pos = 0;
 	clock_t ts = clock();
 	frame->ts = ts;
@@ -502,7 +506,7 @@ int main(int argc, char *argv[])
 	char buffer[BUFSIZE];
 	struct sockaddr saddr;
 	int opt;
-	timespec starttime, endtime;
+	struct timespec starttime, endtime;
 	clock_gettime(CLOCK_MONOTONIC, &starttime);
 
 	unsigned char bcast[] = "\xFF\xFF\xFF\xFF\xFF\xFF";
@@ -578,7 +582,7 @@ int main(int argc, char *argv[])
 	sock_close();
 	printf("Station List: \n");
 	print_stalist(sta_head->next);
-	timespec ts = tsdiff(starttime, endtime);
+	struct timespec ts = tsdiff(starttime, endtime);
 	printf("Total Running Time: %ld.%lds\n", ts.tv_sec, ts.tv_nsec / 1000);
 	return 0;
 }
