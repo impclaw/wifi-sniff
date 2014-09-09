@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <stdarg.h>
+#include <unistd.h>
 #include <time.h>
 #include <net/if.h>
 #include <netlink/genl/genl.h>
@@ -12,13 +13,35 @@
 
 #define DEVICE_BUSY -16
 #define ETH_ALEN 6
+#define PARAMS "h"
+#define USAGE "Usage: %s [-" PARAMS "] [managed iface] [monitor iface] [ssid]\n"
+#define HELP USAGE "\nSimple wifi interface monitoring\n\n" \
+"[managed iface] which interface to send probe request on\n" \
+"[monitor iface] which interface to monitor for probe response\n" \
+"[ssid]          probe request ssid\n" \
+"  -h    display this help and exit\n" \
+""
 #define u8 unsigned char
 
 static int handle_id;
+struct timespec starttime, endtime;
 void die(const char* msg)
 {
 	fprintf(stderr,"%s\n", msg);
 	exit(-1);
+}
+
+struct timespec tsdiff(struct timespec start, struct timespec end)
+{
+	struct timespec temp;
+	if ((end.tv_nsec-start.tv_nsec)<0) {
+		temp.tv_sec = end.tv_sec-start.tv_sec-1;
+		temp.tv_nsec = 1000000000+end.tv_nsec-start.tv_nsec;
+	} else {
+		temp.tv_sec = end.tv_sec-start.tv_sec;
+		temp.tv_nsec = end.tv_nsec-start.tv_nsec;
+	}
+	return temp;
 }
 
 int probereq(char* ssid, unsigned char** req)
@@ -102,6 +125,9 @@ static struct nl_msg *gen_msg(int iface, char* ssid, int chan){
 
 static int ack_handler(struct nl_msg *msg, void *arg){
 	int *err = arg;
+	clock_gettime(CLOCK_MONOTONIC, &endtime);
+	struct timespec ts = tsdiff(starttime, endtime);
+	printf("Probe Reponse Time: %ld.%lds\n", ts.tv_sec, ts.tv_nsec / 1000);
 	*err = 0;
 	return NL_STOP;
 }
@@ -123,6 +149,7 @@ static int send_and_recv(struct nl_handle* handle, struct nl_msg* msg, struct nl
 	tmp_cb = nl_cb_clone(cb);
 	if (!cb)
 		goto out;
+	clock_gettime(CLOCK_MONOTONIC, &starttime);
 	err = nl_send_auto_complete(handle, msg);
 	if (err < 0)
 		goto out;
@@ -140,10 +167,32 @@ static int send_and_recv(struct nl_handle* handle, struct nl_msg* msg, struct nl
 	return err;
 }
 
-int main()
+int main(int argc, char *argv[])
 {
-	char* ssid = "KAU-STUDENT";
-	char* ifacename = "wlan0";
+	int opt;
+
+	while ((opt = getopt(argc, argv, PARAMS)) != -1)
+	{
+		switch (opt)
+		{
+			case 'h':
+				fprintf(stdout, HELP, argv[0]);
+				exit(EXIT_SUCCESS);
+			default:
+				fprintf(stderr, USAGE, argv[0]);
+				exit(EXIT_FAILURE);
+		}
+	}
+
+	if (optind >= argc - 2)
+	{
+		fprintf(stderr, USAGE, argv[0]);
+		exit(EXIT_FAILURE);
+	}
+
+	char* ssid = argv[optind+2];
+	char* monifname = argv[optind+1];
+	char* ifacename = argv[optind];
 	int iface = if_nametoindex(ifacename);
 
 
