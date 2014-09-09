@@ -1,284 +1,180 @@
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <sys/ioctl.h>
-#include <errno.h>
-#include <time.h>
-#include <string.h>
-#include <signal.h>
 #include <stdio.h>
+#include <signal.h>
+#include <stdint.h>
 #include <stdlib.h>
-#include <unistd.h>
-#include <arpa/inet.h>
-#include <netpacket/packet.h>
-#include <net/ethernet.h>
+#include <stdarg.h>
+#include <time.h>
 #include <net/if.h>
+#include <netlink/genl/genl.h>
+#include <netlink/genl/family.h>
+#include <netlink/genl/ctrl.h>
+#include "nl80211.h"
 
-#define BUFSIZE 2048
-#define PARAMS "h"
-#define USAGE "Usage: %s [-" PARAMS "] [managed if] [monitor if] [ssid]\n"
-#define HELP USAGE "\nSimple wifi interface monitoring\n\n" \
-"[maclist...] which mac addresses to monitor, empty = all\n" \
-"[interface]  which interface to monitor\n" \
-"  -h    display this help and exit\n" \
-""
-#define IEEE80211_FTYPE_MGMT            0x0000
-#define IEEE80211_STYPE_PROBE_REQ       0x004
-#define IEEE80211_STYPE_PROBE_RESP      0x005
+#define DEVICE_BUSY -16
+#define ETH_ALEN 6
+#define u8 unsigned char
 
-#define CNORMAL  "\033[0m"
-#define CRED     "\033[31m"
-#define CGREEN   "\033[32m"
-#define CYELLOW  "\033[33m"
-#define CBLUE    "\033[34m"
-#define CMAGENTA "\033[35m"
-#define CCYAN    "\033[36m"
-#define CWHITE   "\033[37m"
-
-//char * colors[] = {CRED, CGREEN, CYELLOW, CBLUE, CMAGENTA, CCYAN, CWHITE};
-typedef int bool;
-#define true 1
-#define false 0
-
-int sock_man;
-int sock_mon;
-
-int maclist_count;
-unsigned char * maclist = NULL; //contains mac list
-
-struct wframe
+static int handle_id;
+void die(const char* msg)
 {
-	bool nowifi;
-	int ts, diffts;
-	int type;
-	int stype;
-	uint16_t nav; //nav in usec
-	unsigned char addr1[6];
-	unsigned char addr2[6];
-	unsigned char addr3[6];
-	unsigned char* rxaddr;
-	unsigned char* txaddr;
-
-	bool retry;
-	bool powermgmt;
-};
-
-static bool keepRunning = true;
-
-void intHandler(int dummy) 
-{
-	if(keepRunning == false)
-	{
-		exit(0);
-	}
-    keepRunning = false;
+	fprintf(stderr,"%s\n", msg);
+	exit(-1);
 }
 
-struct timespec tsdiff(struct timespec start, struct timespec end)
-{
-	struct timespec temp;
-	if ((end.tv_nsec-start.tv_nsec)<0) {
-		temp.tv_sec = end.tv_sec-start.tv_sec-1;
-		temp.tv_nsec = 1000000000+end.tv_nsec-start.tv_nsec;
-	} else {
-		temp.tv_sec = end.tv_sec-start.tv_sec;
-		temp.tv_nsec = end.tv_nsec-start.tv_nsec;
-	}
-	return temp;
-}
-
-int sock_bind(int sock, const char * ifname) { 
-    struct sockaddr_ll sll;
-    struct ifreq ifr; bzero(&sll , sizeof(sll));
-    bzero(&ifr , sizeof(ifr)); 
-    strncpy((char *)ifr.ifr_name , ifname, IFNAMSIZ); 
-    //copy device name to ifr 
-    if((ioctl(sock, SIOCGIFINDEX, &ifr)) == -1)
-    { 
-        perror("Unable to find interface index");
-        exit(-1); 
-    }
-    sll.sll_family = AF_PACKET; 
-    sll.sll_ifindex = ifr.ifr_ifindex; 
-    sll.sll_protocol = htons(ETH_P_ALL); 
-    if((bind(sock , (struct sockaddr *)&sll , sizeof(sll))) ==-1)
-    {
-        perror("bind: ");
-        exit(-1);
-    }
-    return sock;
-}
-
-int sock_open()
-{
-	int sock = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
-	if(sock == -1) {
-		if(errno == EPERM)
-			printf("You require root priviliges to monitor network data. \n");
-		else
-			printf("Socket creation failed: %d \n", errno);
-		exit(-1);
-	}
-	return sock;
-}
-
-void sock_close()
-{
-	close(sock_mon);
-	close(sock_man);
-}
-
-void print_addr(unsigned char* addr)
-{
-	for(int i = 0; i < 6; i++)
-		i == 5 ? printf("%02x", addr[i]) : printf("%02x:", addr[i]);
-}
-
-clock_t lastts;
-struct wframe * buffertowframe(char * buffer, int size)
-{
-	//Let's process the packet. 
-	//First remove radiotap. 
-	struct wframe *frame;
-	frame = (struct wframe *) malloc(sizeof(struct wframe));
-	memset(frame, 0, sizeof(struct wframe));
-	int pos = 0;
-	clock_t ts = clock();
-	frame->ts = ts;
-	frame->diffts = ts - lastts;
-	lastts = ts;
-	uint8_t radiotap_version = buffer[pos++];
-	uint8_t radiotap_pad = buffer[pos++];
-	uint16_t radiotap_length = buffer[pos];
-	if (radiotap_version != 0 || radiotap_pad != 0 || radiotap_length > 1000) {
-		frame->nowifi = true;
-		return frame;
-	}
-
-	//Skip Radiotap
-	pos += radiotap_length - 4 + 2;
-
-	//Decode packet type
-	uint16_t fc = buffer[pos]; //frame control info
-	pos += 2;
-	if((fc & 0x04) != 0) frame->type  += 0x2;
-	if((fc & 0x08) != 0) frame->type  += 0x1;
-	if((fc & 0x10) != 0) frame->stype += 0x1;
-	if((fc & 0x20) != 0) frame->stype += 0x2;
-	if((fc & 0x40) != 0) frame->stype += 0x4;
-	if((fc & 0x80) != 0) frame->stype += 0x8;
-	if(frame->type != IEEE80211_FTYPE_MGMT)
-		return NULL;
-	if(frame->stype != IEEE80211_STYPE_PROBE_RESP)
-		return NULL;
-	frame->retry = (fc & 0x400);
-	frame->powermgmt = (fc & 0x800);
-	frame->nav = buffer[pos];
-	pos += 2;
-	memcpy(&frame->addr1, buffer+pos, 6); //This address is always there
-	pos += 6;
-	memcpy(&frame->addr2, buffer+pos, 6);
-	pos += 6;
-	memcpy(&frame->addr3, buffer+pos, 6);
-	pos += 6;
-
-FCS:
-	pos += 2; //TODO: Parse sequence number (fcs)
-	frame->rxaddr = frame->addr1;
-	frame->txaddr = frame->addr2;
-
-	return frame;
-}
-
-
-void analyze(char* buffer, int size)
-{
-	struct wframe *frame = buffertowframe(buffer, size);
-	if(frame == NULL)
-		return;
-	printf("Probe Reponse\n");
-	fflush(stdout);
-	free(frame);
-}
-
-int probereq(char* ssid, char** req)
+int probereq(char* ssid, unsigned char** req)
 {
 	//char * req = malloc(BUFSIZE);
-	int sz = 4 + 6*3 + 2;
-	*req = malloc(BUFSIZE);
-	*(req)[0] = 0x40; //Prob Req
-	*(req)[1] = 0x0; //Frame control flags
-	*(req)[2] = 0x0;
-	*(req)[3] = 0x0;
-	int p = 4;
-	*(req)[p++] = 0xFF; *(req)[p++] = 0xFF; *(req)[p++] = 0xFF; *(req)[p++] = 0xFF; *(req)[p++] = 0xFF; *(req)[p++] = 0xFF;
-	*(req)[p++] = 0xDE; *(req)[p++] = 0xAD; *(req)[p++] = 0xBE; *(req)[p++] = 0xEF; *(req)[p++] = 0x00; *(req)[p++] = 0x01;
-	*(req)[p++] = 0xFF; *(req)[p++] = 0xFF; *(req)[p++] = 0xFF; *(req)[p++] = 0xFF; *(req)[p++] = 0xFF; *(req)[p++] = 0xFF;
-	*(req)[p++] = 0x40;
-	*(req)[p++] = 0x48;
+	int sz = 0;
+	sz += 4 + 6*3 + 2; //header
+	sz += 2 + strlen(ssid); //ssid param
+	sz += (4+2)*2; //rates + ext. rates param
+
+	*req = malloc(sz);
+	int p = 0;
+	(*req)[p++] = 0x40; //Prob Req
+	(*req)[p++] = 0x0; //Frame control flags
+	(*req)[p++] = 0x0;
+	(*req)[p++] = 0x0;
+	(*req)[p++] = 0xFF; (*req)[p++] = 0xFF; (*req)[p++] = 0xFF; (*req)[p++] = 0xFF; (*req)[p++] = 0xFF; (*req)[p++] = 0xFF;
+	(*req)[p++] = 0xDE; (*req)[p++] = 0xAD; (*req)[p++] = 0xBE; (*req)[p++] = 0xEF; (*req)[p++] = 0x00; (*req)[p++] = 0x01;
+	(*req)[p++] = 0xFF; (*req)[p++] = 0xFF; (*req)[p++] = 0xFF; (*req)[p++] = 0xFF; (*req)[p++] = 0xFF; (*req)[p++] = 0xFF;
+	(*req)[p++] = 0x40;
+	(*req)[p++] = 0x48;
+	//Tagged params
+	(*req)[p++] = 0x00; //SSID
+	(*req)[p++] = strlen(ssid); //LEN
+	strcpy((char*)(*req+p), ssid);
+	p+= (*req)[p-1];
+
+	(*req)[p++] = 0x01; //Std. Rates
+	(*req)[p++] = 0x04; //Len
+	(*req)[p++] = 0x0c;
+	(*req)[p++] = 0x12;
+	(*req)[p++] = 0x18;
+	(*req)[p++] = 0x24;
+
+	(*req)[p++] = 0x32; //Ext. Rates
+	(*req)[p++] = 0x04; //Len
+	(*req)[p++] = 0x30;
+	(*req)[p++] = 0x48;
+	(*req)[p++] = 0x60;
+	(*req)[p++] = 0x6c;
+
+
+	//raise(SIGABRT);
 	return sz;
 }
 
-int main(int argc, char *argv[])
-{
-	char buffer[BUFSIZE];
-	struct sockaddr saddr_mon;
-	struct sockaddr saddr_man;
-	int opt;
-	struct timespec starttime, endtime;
-	clock_gettime(CLOCK_MONOTONIC, &starttime);
+static struct nl_msg *gen_msg(int iface, char* ssid, int chan){
+	struct nl_msg *msg, *ssids, *freqs;
 
-	unsigned char bcast[] = "\xFF\xFF\xFF\xFF\xFF\xFF";
-	signal(SIGINT, intHandler);
+	msg  = nlmsg_alloc();
+	ssids = nlmsg_alloc();
+	freqs = nlmsg_alloc();
 
-	while ((opt = getopt(argc, argv, PARAMS)) != -1)
-	{
-		switch (opt)
-		{
-			case 'h':
-				fprintf(stdout, HELP, argv[0]);
-				exit(EXIT_SUCCESS);
-			default:
-				fprintf(stderr, USAGE, argv[0]);
-				exit(EXIT_FAILURE);
-		}
+	if (!msg || !ssids || !freqs){
+		fprintf(stderr, "Failed to allocate netlink message");
+	if(msg)
+		nlmsg_free(msg);
+	if(ssids)
+		nlmsg_free(ssids);
+	if(freqs)
+		nlmsg_free(freqs);
+		return NULL;
 	}
 
-	if (optind >= argc - 2)
-	{
-		fprintf(stderr, USAGE, argv[0]);
-		exit(EXIT_FAILURE);
-	}
+	genlmsg_put(msg, 0, 0, handle_id, 0, 0, NL80211_CMD_TRIGGER_SCAN, 0);
+	NLA_PUT_U32(msg, NL80211_ATTR_IFINDEX, iface);
 
-	char * ifaceman = argv[optind];
-	char * ifacemon = argv[optind + 1];
-	char * ssid = argv[optind + 2];
+	NLA_PUT(ssids, 1, strlen(ssid), ssid);
+	nla_put_nested(msg, NL80211_ATTR_SCAN_SSIDS, ssids);
 
-	sock_man = sock_open();
-	sock_mon = sock_open();
-	sock_man = sock_bind(sock_man, ifaceman);
-	sock_mon = sock_bind(sock_mon, ifacemon);
+	NLA_PUT_U32(freqs, 1, chan*5 + 2407);
+	nla_put_nested(msg, NL80211_ATTR_SCAN_FREQUENCIES, freqs);
 
-	char* pkt;
-	int sz = probereq(ssid, &pkt);
-	printf("pkt: %d\n", pkt[20]);
-	socklen_t saddr_size_man = sizeof saddr_man;
-	int size = send(sock_man, pkt, sz, 0);
-	free(pkt);
-	printf("Probe Req. sent (%d), waiting for response...\n", errno);
-	fflush(stdout);
 
-	while(keepRunning) {
-		socklen_t saddr_size_mon = sizeof saddr_mon;
-		int size = recvfrom(sock_mon, buffer, BUFSIZE, 0, &saddr_mon, &saddr_size_mon);
-		analyze(buffer, size);
-	}
-	clock_gettime(CLOCK_MONOTONIC, &endtime);
-	printf(CNORMAL);
-	sock_close();
-	struct timespec ts = tsdiff(starttime, endtime);
-	printf("Total Running Time: %ld.%lds\n", ts.tv_sec, ts.tv_nsec / 1000);
-	return 0;
+	return msg;
+	nla_put_failure:
+
+	nlmsg_free(msg);
+	return NULL;
 }
 
+static int ack_handler(struct nl_msg *msg, void *arg){
+	int *err = arg;
+	*err = 0;
+	return NL_STOP;
+}
+static int finish_handler(struct nl_msg *msg, void *arg){
+	int *ret = arg;
+	*ret = 0;
+	return NL_SKIP;
+}
+static int error_handler(struct sockaddr_nl *nla, struct nlmsgerr *err, void *arg){
+	int *ret = arg;
+	fprintf(stderr, "Err: %d\n", err->error);
+	*ret = err->error;
+	return NL_SKIP;
+}
+
+static int send_and_recv(struct nl_handle* handle, struct nl_msg* msg, struct nl_cb* cb){
+	int err = -1;
+	struct nl_cb *tmp_cb;
+	tmp_cb = nl_cb_clone(cb);
+	if (!cb)
+		goto out;
+	err = nl_send_auto_complete(handle, msg);
+	if (err < 0)
+		goto out;
+
+	err = 1;
+	nl_cb_err(tmp_cb, NL_CB_CUSTOM, error_handler, &err);
+	nl_cb_set(tmp_cb, NL_CB_FINISH, NL_CB_CUSTOM, finish_handler, &err);
+	nl_cb_set(tmp_cb, NL_CB_ACK, NL_CB_CUSTOM, ack_handler, &err);
+	while(err > 0)
+		nl_recvmsgs(handle, tmp_cb);
+
+	out:
+	nlmsg_free(msg);
+	nl_cb_put(tmp_cb);
+	return err;
+}
+
+int main()
+{
+	char* ssid = "KAU-STUDENT";
+	char* ifacename = "wlan0";
+	int iface = if_nametoindex(ifacename);
 
 
+	struct nl_cb *cb = nl_cb_alloc(NL_CB_DEFAULT);
+	if(!cb)
+		die("Can't allocate cb");
+	struct nl_handle *handle;
+	handle = nl_handle_alloc_cb(cb);
+	if(!handle)
+		die("Can't allocate handle");
+	if(genl_connect(handle))
+		die("Can't connect to generic netlink");
+
+	if ((handle_id = genl_ctrl_resolve(handle, "nl80211")) < 0)
+		die("Can't resolve generic netlink");
+	
+	printf("Sending one probe request\n");
+
+	int ret;
+	struct nl_msg* msg;
+	do
+	{
+		msg = gen_msg(iface, ssid, 3);
+		ret = send_and_recv(handle, msg, cb);
+	}while(ret == DEVICE_BUSY);
+	
+	if (ret)
+		printf("Sending failed %s\n", strerror(-ret));
+	else
+		printf("Sending OK\n");
+	
+
+
+}
