@@ -4,15 +4,31 @@
 #include <stdlib.h>
 #include <stdarg.h>
 #include <unistd.h>
+#include <pthread.h>
+#include <errno.h>
 #include <time.h>
+
+#include <arpa/inet.h>
+#include <netpacket/packet.h>
+#include <net/ethernet.h>
 #include <net/if.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <sys/ioctl.h>
+
 #include <netlink/genl/genl.h>
 #include <netlink/genl/family.h>
 #include <netlink/genl/ctrl.h>
 #include "nl80211.h"
 
+#define IEEE80211_FTYPE_MGMT            0x0000
+#define IEEE80211_FTYPE_CTL             0x0004
+#define IEEE80211_FTYPE_DATA            0x0008
+#define IEEE80211_STYPE_PROBE_REQ       0x004
+#define IEEE80211_STYPE_PROBE_RESP      0x005
 #define DEVICE_BUSY -16
 #define ETH_ALEN 6
+#define BUFSIZE 2048
 #define PARAMS "h"
 #define USAGE "Usage: %s [-" PARAMS "] [managed iface] [monitor iface] [ssid]\n"
 #define HELP USAGE "\nSimple wifi interface monitoring\n\n" \
@@ -22,9 +38,29 @@
 "  -h    display this help and exit\n" \
 ""
 #define u8 unsigned char
+#define bool int
+#define false 0
+#define true !false
 
+struct wframe
+{
+	int ts, diffts;
+	int type;
+	int stype;
+	uint16_t nav; //nav in usec
+	unsigned char addr1[6];
+	unsigned char addr2[6];
+	unsigned char addr3[6];
+	unsigned char* rxaddr;
+	unsigned char* txaddr;
+
+	bool retry;
+	bool powermgmt;
+};
 static int handle_id;
-struct timespec starttime, endtime;
+int sock;
+pthread_t monthread;
+
 void die(const char* msg)
 {
 	fprintf(stderr,"%s\n", msg);
@@ -44,48 +80,91 @@ struct timespec tsdiff(struct timespec start, struct timespec end)
 	return temp;
 }
 
-int probereq(char* ssid, unsigned char** req)
+int sock_bind(const char * ifname) { 
+    struct sockaddr_ll sll;
+    struct ifreq ifr; bzero(&sll , sizeof(sll));
+    bzero(&ifr , sizeof(ifr)); 
+    strncpy((char *)ifr.ifr_name , ifname, IFNAMSIZ); 
+    //copy device name to ifr 
+    if((ioctl(sock, SIOCGIFINDEX, &ifr)) == -1)
+    { 
+        perror("Unable to find interface index");
+        exit(-1); 
+    }
+    sll.sll_family = AF_PACKET; 
+    sll.sll_ifindex = ifr.ifr_ifindex; 
+    sll.sll_protocol = htons(ETH_P_ALL); 
+    if((bind(sock , (struct sockaddr *)&sll , sizeof(sll))) ==-1)
+    {
+        perror("bind: ");
+        exit(-1);
+    }
+    return 0;
+}
+
+int sock_open()
 {
-	//char * req = malloc(BUFSIZE);
-	int sz = 0;
-	sz += 4 + 6*3 + 2; //header
-	sz += 2 + strlen(ssid); //ssid param
-	sz += (4+2)*2; //rates + ext. rates param
+	sock = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
+	if(sock == -1) {
+		if(errno == EPERM)
+			printf("You require root priviliges to monitor network data. ");
+		else
+			printf("Socket creation failed: %d", errno);
+		return errno;
+	}
+	return 0;
+}
 
-	*req = malloc(sz);
-	int p = 0;
-	(*req)[p++] = 0x40; //Prob Req
-	(*req)[p++] = 0x0; //Frame control flags
-	(*req)[p++] = 0x0;
-	(*req)[p++] = 0x0;
-	(*req)[p++] = 0xFF; (*req)[p++] = 0xFF; (*req)[p++] = 0xFF; (*req)[p++] = 0xFF; (*req)[p++] = 0xFF; (*req)[p++] = 0xFF;
-	(*req)[p++] = 0xDE; (*req)[p++] = 0xAD; (*req)[p++] = 0xBE; (*req)[p++] = 0xEF; (*req)[p++] = 0x00; (*req)[p++] = 0x01;
-	(*req)[p++] = 0xFF; (*req)[p++] = 0xFF; (*req)[p++] = 0xFF; (*req)[p++] = 0xFF; (*req)[p++] = 0xFF; (*req)[p++] = 0xFF;
-	(*req)[p++] = 0x40;
-	(*req)[p++] = 0x48;
-	//Tagged params
-	(*req)[p++] = 0x00; //SSID
-	(*req)[p++] = strlen(ssid); //LEN
-	strcpy((char*)(*req+p), ssid);
-	p+= (*req)[p-1];
+void sock_close()
+{
+	close(sock);
+}
 
-	(*req)[p++] = 0x01; //Std. Rates
-	(*req)[p++] = 0x04; //Len
-	(*req)[p++] = 0x0c;
-	(*req)[p++] = 0x12;
-	(*req)[p++] = 0x18;
-	(*req)[p++] = 0x24;
+struct wframe * buffertowframe(char * buffer, int size)
+{
+	//Let's process the packet. 
+	//First remove radiotap. 
+	struct wframe *frame;
+	frame = (struct wframe *) malloc(sizeof(struct wframe));
+	memset(frame, 0, sizeof(struct wframe));
+	int pos = 0;
+	uint8_t radiotap_version = buffer[pos++];
+	uint8_t radiotap_pad = buffer[pos++];
+	uint16_t radiotap_length = buffer[pos];
+	if (radiotap_version != 0 || radiotap_pad != 0 || radiotap_length > 1000) {
+		return NULL;
+	}
 
-	(*req)[p++] = 0x32; //Ext. Rates
-	(*req)[p++] = 0x04; //Len
-	(*req)[p++] = 0x30;
-	(*req)[p++] = 0x48;
-	(*req)[p++] = 0x60;
-	(*req)[p++] = 0x6c;
+	//Skip Radiotap
+	pos += radiotap_length - 4 + 2;
 
+	//Decode packet type
+	uint16_t fc = buffer[pos]; //frame control info
+	pos += 2;
+	if((fc & 0x04) != 0) frame->type  += 0x2;
+	if((fc & 0x08) != 0) frame->type  += 0x1;
+	if((fc & 0x10) != 0) frame->stype += 0x1;
+	if((fc & 0x20) != 0) frame->stype += 0x2;
+	if((fc & 0x40) != 0) frame->stype += 0x4;
+	if((fc & 0x80) != 0) frame->stype += 0x8;
+	if(frame->type != IEEE80211_FTYPE_MGMT)
+		return NULL;
+	if(frame->stype != IEEE80211_STYPE_PROBE_REQ && frame->stype != IEEE80211_STYPE_PROBE_RESP)
+		return NULL;
+	frame->retry = (fc & 0x400);
+	frame->powermgmt = (fc & 0x800);
+	frame->nav = buffer[pos];
+	pos += 2;
+	memcpy(&frame->addr1, buffer+pos, 6); //This address is always there
+	pos += 6;
+	memcpy(&frame->addr2, buffer+pos, 6);
+	pos += 6;
+	memcpy(&frame->addr3, buffer+pos, 6);
+	pos += 6;
 
-	//raise(SIGABRT);
-	return sz;
+FCS:
+	pos += 2; //TODO: Parse sequence number (fcs)
+	return frame;
 }
 
 static struct nl_msg *gen_msg(int iface, char* ssid, int chan){
@@ -125,9 +204,6 @@ static struct nl_msg *gen_msg(int iface, char* ssid, int chan){
 
 static int ack_handler(struct nl_msg *msg, void *arg){
 	int *err = arg;
-	clock_gettime(CLOCK_MONOTONIC, &endtime);
-	struct timespec ts = tsdiff(starttime, endtime);
-	printf("Probe Reponse Time: %ld.%lds\n", ts.tv_sec, ts.tv_nsec / 1000);
 	*err = 0;
 	return NL_STOP;
 }
@@ -149,7 +225,6 @@ static int send_and_recv(struct nl_handle* handle, struct nl_msg* msg, struct nl
 	tmp_cb = nl_cb_clone(cb);
 	if (!cb)
 		goto out;
-	clock_gettime(CLOCK_MONOTONIC, &starttime);
 	err = nl_send_auto_complete(handle, msg);
 	if (err < 0)
 		goto out;
@@ -166,6 +241,40 @@ static int send_and_recv(struct nl_handle* handle, struct nl_msg* msg, struct nl
 	nl_cb_put(tmp_cb);
 	return err;
 }
+
+volatile int state = 0;
+char* ssid;
+char* monifname;
+char* ifacename;
+
+void *mon_run()
+{
+	static struct timespec starttime, endtime;
+	char buffer[BUFSIZE];
+	struct sockaddr saddr;
+	if (sock_open()) return 0;
+	if (sock_bind(monifname)) return 0;
+	state = 1;
+	while(state == 1) {
+		socklen_t saddr_size = sizeof saddr;
+		int size = recvfrom(sock, buffer, BUFSIZE, 0, &saddr, &saddr_size);
+		struct wframe * frame = buffertowframe(buffer, size);
+		if (frame == NULL)
+			continue;
+		if(frame->stype == IEEE80211_STYPE_PROBE_REQ)
+			clock_gettime(CLOCK_MONOTONIC, &starttime);
+		if(frame->stype == IEEE80211_STYPE_PROBE_RESP)
+		{
+			clock_gettime(CLOCK_MONOTONIC, &endtime);
+			struct timespec ts = tsdiff(starttime, endtime);
+			printf("Probe Reponse Time: %ld.%lds\n", ts.tv_sec, ts.tv_nsec / 1000);
+			state = 2;
+		}
+		free(frame);
+	}
+	state = 2;
+}
+
 
 int main(int argc, char *argv[])
 {
@@ -190,11 +299,12 @@ int main(int argc, char *argv[])
 		exit(EXIT_FAILURE);
 	}
 
-	char* ssid = argv[optind+2];
-	char* monifname = argv[optind+1];
-	char* ifacename = argv[optind];
-	int iface = if_nametoindex(ifacename);
+	pthread_create(&monthread, NULL, mon_run, NULL);
 
+	ssid = argv[optind+2];
+	monifname = argv[optind+1];
+	ifacename = argv[optind];
+	int iface = if_nametoindex(ifacename);
 
 	struct nl_cb *cb = nl_cb_alloc(NL_CB_DEFAULT);
 	if(!cb)
@@ -209,7 +319,7 @@ int main(int argc, char *argv[])
 	if ((handle_id = genl_ctrl_resolve(handle, "nl80211")) < 0)
 		die("Can't resolve generic netlink");
 	
-	printf("Sending one probe request\n");
+	usleep(1000);
 
 	int ret;
 	struct nl_msg* msg;
@@ -221,9 +331,10 @@ int main(int argc, char *argv[])
 	
 	if (ret)
 		printf("Sending failed %s\n", strerror(-ret));
-	else
-		printf("Sending OK\n");
 	
-
+	while(state != 2)
+	{
+		usleep(100);
+	}
 
 }
