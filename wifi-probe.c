@@ -30,11 +30,12 @@
 #define ETH_ALEN 6
 #define BUFSIZE 2048
 #define PARAMS "h"
-#define USAGE "Usage: %s [-" PARAMS "] [managed iface] [monitor iface] [ssid]\n"
-#define HELP USAGE "\nSimple wifi interface monitoring\n\n" \
+#define USAGE "Usage: %s [-" PARAMS "] [managed iface] [monitor iface] [ssid] [channel]\n"
+#define HELP USAGE "\nGenerates probe req and times probe resp delay\n\n" \
 "[managed iface] which interface to send probe request on\n" \
 "[monitor iface] which interface to monitor for probe response\n" \
 "[ssid]          probe request ssid\n" \
+"[channel]       channel to send probe on\n" \
 "  -h    display this help and exit\n" \
 ""
 #define u8 unsigned char
@@ -57,18 +58,36 @@ struct wframe
 	bool retry;
 	bool powermgmt;
 };
+
 static int handle_id;
 int sock;
 pthread_t monthread;
+volatile int state = 0;
+char* ssid;
+char* monifname;
+char* ifacename;
+unsigned char stamac[6];
 
-void die(const char* msg)
-{
+void die(const char* msg);
+struct timespec tsdiff(struct timespec start, struct timespec end);
+bool maccmp(u8 * mac1, u8* mac2);
+int sock_bind(const char * ifname); 
+int sock_open();
+void sock_close();
+struct wframe * buffertowframe(char * buffer, int size);
+static struct nl_msg *gen_msg(int iface, char* ssid, int chan);
+static int ack_handler(struct nl_msg *msg, void *arg);
+static int finish_handler(struct nl_msg *msg, void *arg);
+static int error_handler(struct sockaddr_nl *nla, struct nlmsgerr *err, void *arg);
+static int send_and_recv(struct nl_handle* handle, struct nl_msg* msg, struct nl_cb* cb);
+void *mon_run();
+
+void die(const char* msg) {
 	fprintf(stderr,"%s\n", msg);
 	exit(-1);
 }
 
-struct timespec tsdiff(struct timespec start, struct timespec end)
-{
+struct timespec tsdiff(struct timespec start, struct timespec end) {
 	struct timespec temp;
 	if ((end.tv_nsec-start.tv_nsec)<0) {
 		temp.tv_sec = end.tv_sec-start.tv_sec-1;
@@ -80,30 +99,35 @@ struct timespec tsdiff(struct timespec start, struct timespec end)
 	return temp;
 }
 
-int sock_bind(const char * ifname) { 
-    struct sockaddr_ll sll;
-    struct ifreq ifr; bzero(&sll , sizeof(sll));
-    bzero(&ifr , sizeof(ifr)); 
-    strncpy((char *)ifr.ifr_name , ifname, IFNAMSIZ); 
-    //copy device name to ifr 
-    if((ioctl(sock, SIOCGIFINDEX, &ifr)) == -1)
-    { 
-        perror("Unable to find interface index");
-        exit(-1); 
-    }
-    sll.sll_family = AF_PACKET; 
-    sll.sll_ifindex = ifr.ifr_ifindex; 
-    sll.sll_protocol = htons(ETH_P_ALL); 
-    if((bind(sock , (struct sockaddr *)&sll , sizeof(sll))) ==-1)
-    {
-        perror("bind: ");
-        exit(-1);
-    }
-    return 0;
+bool maccmp(u8 * mac1, u8* mac2) {
+	for(int i = 0; i < 6; i++)
+		if(mac1[i] != mac2[i])
+			return false;
+	return true;
 }
 
-int sock_open()
-{
+int sock_bind(const char * ifname) { 
+	struct sockaddr_ll sll;
+	struct ifreq ifr; bzero(&sll , sizeof(sll));
+	bzero(&ifr , sizeof(ifr)); 
+	strncpy((char *)ifr.ifr_name , ifname, IFNAMSIZ); 
+	//copy device name to ifr 
+	if((ioctl(sock, SIOCGIFINDEX, &ifr)) == -1) { 
+		perror("Unable to find interface index");
+		exit(-1); 
+	}
+	sll.sll_family = AF_PACKET; 
+	sll.sll_ifindex = ifr.ifr_ifindex; 
+	sll.sll_protocol = htons(ETH_P_ALL); 
+	if((bind(sock , (struct sockaddr *)&sll , sizeof(sll))) ==-1)
+	{
+		perror("bind: ");
+		exit(-1);
+	}
+	return 0;
+}
+
+int sock_open() {
 	sock = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
 	if(sock == -1) {
 		if(errno == EPERM)
@@ -115,14 +139,11 @@ int sock_open()
 	return 0;
 }
 
-void sock_close()
-{
+void sock_close() {
 	close(sock);
 }
 
-struct wframe * buffertowframe(char * buffer, int size)
-{
-	//Let's process the packet. 
+struct wframe * buffertowframe(char * buffer, int size) {
 	//First remove radiotap. 
 	struct wframe *frame;
 	frame = (struct wframe *) malloc(sizeof(struct wframe));
@@ -134,8 +155,6 @@ struct wframe * buffertowframe(char * buffer, int size)
 	if (radiotap_version != 0 || radiotap_pad != 0 || radiotap_length > 1000) {
 		return NULL;
 	}
-
-	//Skip Radiotap
 	pos += radiotap_length - 4 + 2;
 
 	//Decode packet type
@@ -151,30 +170,28 @@ struct wframe * buffertowframe(char * buffer, int size)
 		return NULL;
 	if(frame->stype != IEEE80211_STYPE_PROBE_REQ && frame->stype != IEEE80211_STYPE_PROBE_RESP)
 		return NULL;
-	frame->retry = (fc & 0x400);
-	frame->powermgmt = (fc & 0x800);
-	frame->nav = buffer[pos];
 	pos += 2;
-	memcpy(&frame->addr1, buffer+pos, 6); //This address is always there
+	memcpy(&frame->addr1, buffer+pos, 6);
 	pos += 6;
 	memcpy(&frame->addr2, buffer+pos, 6);
 	pos += 6;
 	memcpy(&frame->addr3, buffer+pos, 6);
-	pos += 6;
+	pos += 6 + 2;
 
-FCS:
-	pos += 2; //TODO: Parse sequence number (fcs)
-	return frame;
+	if(maccmp(frame->addr1, stamac) || maccmp(frame->addr2, stamac) || maccmp(frame->addr3, stamac))
+		return frame;
+
+	return NULL;
 }
 
-static struct nl_msg *gen_msg(int iface, char* ssid, int chan){
+static struct nl_msg *gen_msg(int iface, char* ssid, int chan) {
 	struct nl_msg *msg, *ssids, *freqs;
 
 	msg  = nlmsg_alloc();
 	ssids = nlmsg_alloc();
 	freqs = nlmsg_alloc();
 
-	if (!msg || !ssids || !freqs){
+	if (!msg || !ssids || !freqs) {
 		fprintf(stderr, "Failed to allocate netlink message");
 	if(msg)
 		nlmsg_free(msg);
@@ -202,24 +219,23 @@ static struct nl_msg *gen_msg(int iface, char* ssid, int chan){
 	return NULL;
 }
 
-static int ack_handler(struct nl_msg *msg, void *arg){
+static int ack_handler(struct nl_msg *msg, void *arg) {
 	int *err = arg;
 	*err = 0;
 	return NL_STOP;
 }
-static int finish_handler(struct nl_msg *msg, void *arg){
+static int finish_handler(struct nl_msg *msg, void *arg) {
 	int *ret = arg;
 	*ret = 0;
 	return NL_SKIP;
 }
-static int error_handler(struct sockaddr_nl *nla, struct nlmsgerr *err, void *arg){
+static int error_handler(struct sockaddr_nl *nla, struct nlmsgerr *err, void *arg) {
 	int *ret = arg;
-	fprintf(stderr, "Err: %d\n", err->error);
 	*ret = err->error;
 	return NL_SKIP;
 }
 
-static int send_and_recv(struct nl_handle* handle, struct nl_msg* msg, struct nl_cb* cb){
+static int send_and_recv(struct nl_handle* handle, struct nl_msg* msg, struct nl_cb* cb) {
 	int err = -1;
 	struct nl_cb *tmp_cb;
 	tmp_cb = nl_cb_clone(cb);
@@ -242,13 +258,7 @@ static int send_and_recv(struct nl_handle* handle, struct nl_msg* msg, struct nl
 	return err;
 }
 
-volatile int state = 0;
-char* ssid;
-char* monifname;
-char* ifacename;
-
-void *mon_run()
-{
+void *mon_run() {
 	static struct timespec starttime, endtime;
 	char buffer[BUFSIZE];
 	struct sockaddr saddr;
@@ -263,8 +273,7 @@ void *mon_run()
 			continue;
 		if(frame->stype == IEEE80211_STYPE_PROBE_REQ)
 			clock_gettime(CLOCK_MONOTONIC, &starttime);
-		if(frame->stype == IEEE80211_STYPE_PROBE_RESP)
-		{
+		if(frame->stype == IEEE80211_STYPE_PROBE_RESP) {
 			clock_gettime(CLOCK_MONOTONIC, &endtime);
 			struct timespec ts = tsdiff(starttime, endtime);
 			printf("Probe Reponse Time: %ld usec\n", ts.tv_sec * 1000 * 1000 + ts.tv_nsec / 1000);
@@ -275,15 +284,12 @@ void *mon_run()
 	state = 2;
 }
 
-
 int main(int argc, char *argv[])
 {
 	int opt;
 
-	while ((opt = getopt(argc, argv, PARAMS)) != -1)
-	{
-		switch (opt)
-		{
+	while ((opt = getopt(argc, argv, PARAMS)) != -1) {
+		switch (opt) {
 			case 'h':
 				fprintf(stdout, HELP, argv[0]);
 				exit(EXIT_SUCCESS);
@@ -293,17 +299,27 @@ int main(int argc, char *argv[])
 		}
 	}
 
-	if (optind >= argc - 2)
-	{
+	if (optind >= argc - 3) {
 		fprintf(stderr, USAGE, argv[0]);
 		exit(EXIT_FAILURE);
 	}
 
 	pthread_create(&monthread, NULL, mon_run, NULL);
 
-	ssid = argv[optind+2];
-	monifname = argv[optind+1];
 	ifacename = argv[optind];
+	monifname = argv[optind+1];
+	ssid = argv[optind+2];
+	int chan = atoi(argv[optind+3]);
+
+	struct ifreq s;
+	int fd = socket(PF_INET, SOCK_DGRAM, IPPROTO_IP);
+	strcpy(s.ifr_name, ifacename);
+	if (ioctl(fd, SIOCGIFHWADDR, &s)) {
+		die("Unable to retrieve hardware address");
+	}
+	close(fd);
+	memcpy(stamac, s.ifr_addr.sa_data, 6);
+
 	int iface = if_nametoindex(ifacename);
 
 	struct nl_cb *cb = nl_cb_alloc(NL_CB_DEFAULT);
@@ -323,18 +339,21 @@ int main(int argc, char *argv[])
 
 	int ret;
 	struct nl_msg* msg;
-	do
-	{
-		msg = gen_msg(iface, ssid, 1);
+	do {
+		msg = gen_msg(iface, ssid, chan);
 		ret = send_and_recv(handle, msg, cb);
 	}while(ret == DEVICE_BUSY);
 	
 	if (ret)
 		printf("Sending failed %s\n", strerror(-ret));
 	
-	while(state != 2)
-	{
+	int ctr = 0;
+	while(state != 2) {
 		usleep(100);
+		ctr++;
+		if(ctr == 40000) {
+			die("No probe response within timeout");
+		}
 	}
 
 }
