@@ -267,7 +267,7 @@ void *mon_run()
 		{
 			clock_gettime(CLOCK_MONOTONIC, &endtime);
 			struct timespec ts = tsdiff(starttime, endtime);
-			printf("Probe Reponse Time: %ld.%lds\n", ts.tv_sec, ts.tv_nsec / 1000);
+			printf("Probe Reponse Time: %ld usec\n", ts.tv_sec * 1000 * 1000 + ts.tv_nsec / 1000);
 			state = 2;
 		}
 		free(frame);
@@ -325,7 +325,7 @@ int main(int argc, char *argv[])
 	struct nl_msg* msg;
 	do
 	{
-		msg = gen_msg(iface, ssid, 3);
+		msg = gen_msg(iface, ssid, 1);
 		ret = send_and_recv(handle, msg, cb);
 	}while(ret == DEVICE_BUSY);
 	
