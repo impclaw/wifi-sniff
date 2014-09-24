@@ -335,7 +335,7 @@ int main(int argc, char *argv[])
 	if ((handle_id = genl_ctrl_resolve(handle, "nl80211")) < 0)
 		die("Can't resolve generic netlink");
 	
-	usleep(1000);
+	usleep(100000);
 
 	int ret;
 	struct nl_msg* msg;
